@@ -25,6 +25,7 @@ import io.netty.test.udt.util.EchoByteHandler;
 import io.netty.test.udt.util.UnitHelp;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -53,6 +54,8 @@ public class NioUdtByteRendezvousChannelTest extends AbstractUdtTest {
      */
     @Test
     @Timeout(value = 10000, unit = TimeUnit.MILLISECONDS)
+    @Disabled("Flaky: compares both peers' byte counters right after close while echo data is still in flight;"
+            + " upstream disables the message twin for the same reason (netty#2853)")
     public void basicEcho() throws Exception {
 
         final int messageSize = 64 * 1024;

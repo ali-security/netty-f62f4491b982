@@ -59,6 +59,12 @@
     </dependency>
 
     <!-- TEST -->
+    <!-- barchart SocketUDT's static initializer needs slf4j, which nothing else puts on this test classpath -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>com.google.caliper</groupId>
       <artifactId>caliper</artifactId>
