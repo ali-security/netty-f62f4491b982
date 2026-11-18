@@ -26,8 +26,12 @@ import java.util.List;
 
 public class JZlibDecoder extends ZlibDecoder {
 
+    private static final int MIN_OUTPUT_BUFFER_SIZE = 512;
     private final Inflater z = new Inflater();
     private byte[] dictionary;
+    private static final int DEFAULT_MAX_FORWARD_BYTES = CompressionUtil.DEFAULT_MAX_FORWARD_BYTES;
+    private final int maxForwardBytes;
+    private boolean needsRead;
     private volatile boolean finished;
 
     /**
@@ -77,6 +81,7 @@ public class JZlibDecoder extends ZlibDecoder {
      */
     public JZlibDecoder(ZlibWrapper wrapper, int maxAllocation) {
         super(maxAllocation);
+        this.maxForwardBytes = maxAllocation > 0 ? maxAllocation : DEFAULT_MAX_FORWARD_BYTES;
 
         ObjectUtil.checkNotNull(wrapper, "wrapper");
 
@@ -112,6 +117,7 @@ public class JZlibDecoder extends ZlibDecoder {
      */
     public JZlibDecoder(byte[] dictionary, int maxAllocation) {
         super(maxAllocation);
+        this.maxForwardBytes = maxAllocation > 0 ? maxAllocation : DEFAULT_MAX_FORWARD_BYTES;
         this.dictionary = ObjectUtil.checkNotNull(dictionary, "dictionary");
         int resultCode;
         resultCode = z.inflateInit(JZlib.W_ZLIB);
@@ -131,6 +137,7 @@ public class JZlibDecoder extends ZlibDecoder {
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+        needsRead = true;
         if (finished) {
             // Skip data received after finished.
             in.skipBytes(in.readableBytes());
@@ -161,7 +168,8 @@ public class JZlibDecoder extends ZlibDecoder {
 
             try {
                 loop: for (;;) {
-                    decompressed = prepareDecompressBuffer(ctx, decompressed, z.avail_in << 1);
+                    decompressed = prepareDecompressBuffer(
+                            ctx, decompressed, Math.max(z.avail_in << 1, MIN_OUTPUT_BUFFER_SIZE));
                     z.avail_out = decompressed.writableBytes();
                     z.next_out = decompressed.array();
                     z.next_out_index = decompressed.arrayOffset() + decompressed.writerIndex();
@@ -172,6 +180,14 @@ public class JZlibDecoder extends ZlibDecoder {
                     int outputLength = z.next_out_index - oldNextOutIndex;
                     if (outputLength > 0) {
                         decompressed.writerIndex(decompressed.writerIndex() + outputLength);
+                        if (maxAllocation == 0 && decompressed.readableBytes() >= maxForwardBytes) {
+                            // If we don't limit the maximum allocations we should just
+                            // forward the buffer directly.
+                            ByteBuf buffer = decompressed;
+                            decompressed = null;
+                            needsRead = false;
+                            ctx.fireChannelRead(buffer);
+                        }
                     }
 
                     switch (resultCode) {
@@ -202,10 +218,13 @@ public class JZlibDecoder extends ZlibDecoder {
                 }
             } finally {
                 in.skipBytes(z.next_in_index - oldNextInIndex);
-                if (decompressed.isReadable()) {
-                    out.add(decompressed);
-                } else {
-                    decompressed.release();
+                if (decompressed != null) {
+                    if (decompressed.isReadable()) {
+                        needsRead = false;
+                        ctx.fireChannelRead(decompressed);
+                    } else {
+                        decompressed.release();
+                    }
                 }
             }
         } finally {
@@ -221,5 +240,16 @@ public class JZlibDecoder extends ZlibDecoder {
     @Override
     protected void decompressionBufferExhausted(ByteBuf buffer) {
         finished = true;
+    }
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        // Discard bytes of the cumulation buffer if needed.
+        discardSomeReadBytes();
+
+        if (needsRead && !ctx.channel().config().isAutoRead()) {
+            ctx.read();
+        }
+        ctx.fireChannelReadComplete();
     }
 }

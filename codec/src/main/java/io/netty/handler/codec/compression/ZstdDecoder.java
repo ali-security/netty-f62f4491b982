@@ -15,10 +15,12 @@
  */
 package io.netty.handler.codec.compression;
 
+import com.github.luben.zstd.ZstdIOException;
 import com.github.luben.zstd.ZstdInputStreamNoFinalizer;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.util.internal.ObjectUtil;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -39,9 +41,11 @@ public final class ZstdDecoder extends ByteToMessageDecoder {
         }
     }
 
+    private final int maxForwardBytes;
     private final MutableByteBufInputStream inputStream = new MutableByteBufInputStream();
     private ZstdInputStreamNoFinalizer zstdIs;
 
+    private boolean needsRead;
     private State currentState = State.DECOMPRESS_DATA;
 
     /**
@@ -52,31 +56,59 @@ public final class ZstdDecoder extends ByteToMessageDecoder {
         CORRUPTED
     }
 
+    public ZstdDecoder() {
+        this(4 * 1024 * 1024);
+    }
+
+    public ZstdDecoder(int maximumAllocationSize) {
+        ObjectUtil.checkPositiveOrZero(maximumAllocationSize, "maximumAllocationSize");
+        this.maxForwardBytes = maximumAllocationSize > 0 ?
+                maximumAllocationSize : CompressionUtil.DEFAULT_MAX_FORWARD_BYTES;
+    }
+
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+        needsRead = true;
         try {
             if (currentState == State.CORRUPTED) {
                 in.skipBytes(in.readableBytes());
+
                 return;
             }
-            final int compressedLength = in.readableBytes();
 
             inputStream.current = in;
 
             ByteBuf outBuffer = null;
+
+            final int compressedLength = in.readableBytes();
             try {
+                long uncompressedLength;
+                if (in.isDirect()) {
+                    uncompressedLength = com.github.luben.zstd.Zstd.getFrameContentSize(
+                            CompressionUtil.safeNioBuffer(in, in.readerIndex(), in.readableBytes()));
+                } else {
+                    uncompressedLength = com.github.luben.zstd.Zstd.getFrameContentSize(
+                            in.array(), in.readerIndex() + in.arrayOffset(), in.readableBytes());
+                }
+                if (uncompressedLength <= 0) {
+                    // Let's start with the compressedLength * 2 as often we will not have everything
+                    // we need in the in buffer and don't want to reserve too much memory.
+                    uncompressedLength = compressedLength * 2L;
+                }
+
                 int w;
                 do {
                     if (outBuffer == null) {
-                        // Let's start with the compressedLength * 2 as often we will not have everything
-                        // we need in the in buffer and don't want to reserve too much memory.
-                        outBuffer = ctx.alloc().heapBuffer(compressedLength * 2);
+                        // The frame content size is read from the (untrusted) frame header, so never use it
+                        // to size the buffer beyond what we forward in one go.
+                        outBuffer = ctx.alloc().heapBuffer((int) Math.min(maxForwardBytes, uncompressedLength));
                     }
                     do {
                         w = outBuffer.writeBytes(zstdIs, outBuffer.writableBytes());
                     } while (w != -1 && outBuffer.isWritable());
                     if (outBuffer.isReadable()) {
-                        out.add(outBuffer);
+                        needsRead = false;
+                        ctx.fireChannelRead(outBuffer);
                         outBuffer = null;
                     }
                 } while (w != -1);
@@ -98,6 +130,17 @@ public final class ZstdDecoder extends ByteToMessageDecoder {
         super.handlerAdded(ctx);
         zstdIs = new ZstdInputStreamNoFinalizer(inputStream);
         zstdIs.setContinuous(true);
+    }
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        // Discard bytes of the cumulation buffer if needed.
+        discardSomeReadBytes();
+
+        if (needsRead && !ctx.channel().config().isAutoRead()) {
+            ctx.read();
+        }
+        ctx.fireChannelReadComplete();
     }
 
     @Override
